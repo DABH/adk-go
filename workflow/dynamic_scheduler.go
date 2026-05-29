@@ -38,6 +38,68 @@ type dynamicSubScheduler struct {
 	// childPath ("<parentPath>/<name>@<runID>"). Failures and HITL
 	// interrupts are not cached.
 	resultByPath map[string]any
+	delegation   outputDelegation
+}
+
+type delegationState int
+
+const (
+	delegationEmpty delegationState = iota
+	delegationReserved
+	delegationCommitted
+)
+
+// outputDelegation is the at-most-one WithUseAsOutput delegation
+// for a parent activation. Lifecycle: empty → reserved → committed,
+// with release rolling reserved back to empty for failed or
+// interrupted children. nil is a valid committed value, so state is
+// the source of truth for whether value is readable.
+//
+// Methods require the enclosing scheduler's mu to be held.
+type outputDelegation struct {
+	state     delegationState
+	childPath string
+	childName string
+	value     any
+}
+
+// reserve claims the delegation for childPath. Re-reserving the
+// same childPath is a no-op (supports WithRunID replay). On
+// conflict the existing holder's name is returned for error
+// reporting.
+func (d *outputDelegation) reserve(childPath, childName string) (existingName string, ok bool) {
+	if d.state != delegationEmpty && d.childPath != childPath {
+		return d.childName, false
+	}
+	d.state = delegationReserved
+	d.childPath = childPath
+	d.childName = childName
+	return "", true
+}
+
+// commit publishes value. Mismatched childPath is silently dropped
+// rather than clobbering another child's delegation.
+func (d *outputDelegation) commit(childPath string, value any) {
+	if d.state == delegationEmpty || d.childPath != childPath {
+		return
+	}
+	d.value = value
+	d.state = delegationCommitted
+}
+
+// release rolls back a reservation. No-op once committed.
+func (d *outputDelegation) release(childPath string) {
+	if d.state != delegationReserved || d.childPath != childPath {
+		return
+	}
+	*d = outputDelegation{}
+}
+
+func (d *outputDelegation) output() (any, bool) {
+	if d.state != delegationCommitted {
+		return nil, false
+	}
+	return d.value, true
 }
 
 func newDynamicSubScheduler(parent NodeContext, parentPath string, emitUp func(*session.Event) error) *dynamicSubScheduler {
@@ -67,9 +129,27 @@ func (s *dynamicSubScheduler) runNode(child Node, input any, opts runNodeOptions
 	}
 	childPath := s.parentPath + "/" + name + "@" + runID
 
+	// A WithRunID replay must re-claim and re-commit the delegation.
 	if cached, ok := s.lookupCachedOutput(childPath); ok {
+		if opts.useAsOutput {
+			if err := s.reserveDelegation(childPath, name); err != nil {
+				return nil, err
+			}
+			s.commitDelegation(childPath, cached)
+		}
 		return cached, nil
 	}
+
+	// Reserve before child.Run so a sibling WithUseAsOutput fails
+	// fast rather than after the child finishes. The deferred
+	// release is a no-op on success (commit advances past reserved)
+	// and a no-op when useAsOutput is false (nothing reserved).
+	if opts.useAsOutput {
+		if err := s.reserveDelegation(childPath, name); err != nil {
+			return nil, err
+		}
+	}
+	defer s.releaseDelegation(childPath)
 
 	childBranch := deriveChildBranch(s.parentCtx.Branch(), name, runID, opts.useSubBranch, opts.overrideBranch)
 	childCtx := newDynamicNodeContext(s.parentCtx.WithBranch(childBranch), childPath, runID, s)
@@ -113,6 +193,13 @@ func (s *dynamicSubScheduler) runNode(child Node, input any, opts runNodeOptions
 		}
 		if ev.Output != nil {
 			out = ev.Output
+			// A delegated child's output is re-emitted by the
+			// parent's terminal event; drop it here to avoid a
+			// duplicate. Partial/state-only events (Output ==
+			// nil) still propagate.
+			if opts.useAsOutput {
+				continue
+			}
 		}
 		if err := s.emitUp(ev); err != nil {
 			return nil, &NodeRunError{
@@ -132,6 +219,9 @@ func (s *dynamicSubScheduler) runNode(child Node, input any, opts runNodeOptions
 	}
 
 	s.storeCachedOutput(childPath, out)
+	if opts.useAsOutput {
+		s.commitDelegation(childPath, out)
+	}
 	return out, nil
 }
 
@@ -146,6 +236,40 @@ func (s *dynamicSubScheduler) storeCachedOutput(childPath string, out any) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.resultByPath[childPath] = out
+}
+
+// reserveDelegation locks and maps a conflict to NodeRunError.
+func (s *dynamicSubScheduler) reserveDelegation(childPath, childName string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	existing, ok := s.delegation.reserve(childPath, childName)
+	if !ok {
+		return &NodeRunError{
+			ChildName: childName,
+			ChildPath: childPath,
+			Cause: fmt.Errorf("%w: %s already delegates to %s",
+				ErrOutputAlreadyDelegated, s.parentPath, existing),
+		}
+	}
+	return nil
+}
+
+func (s *dynamicSubScheduler) commitDelegation(childPath string, value any) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.delegation.commit(childPath, value)
+}
+
+func (s *dynamicSubScheduler) releaseDelegation(childPath string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.delegation.release(childPath)
+}
+
+func (s *dynamicSubScheduler) delegatedOutput() (any, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.delegation.output()
 }
 
 // resolveRunID validates a user-supplied id, or returns the next
