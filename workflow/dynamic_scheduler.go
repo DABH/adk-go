@@ -38,6 +38,17 @@ type dynamicSubScheduler struct {
 	// childPath ("<parentPath>/<name>@<runID>"). Failures and HITL
 	// interrupts are not cached.
 	resultByPath map[string]any
+	// outputDelegated, delegatedChildPath, delegatedChildName: the
+	// at-most-one use_as_output slot. delegatedChildPath
+	// distinguishes an idempotent replay from a forbidden second
+	// delegation.
+	outputDelegated    bool
+	delegatedChildPath string
+	delegatedChildName string
+	// delegatedValue holds the committed child output (nil is a
+	// valid value, so delegatedCommitted gates reads).
+	delegatedValue     any
+	delegatedCommitted bool
 }
 
 func newDynamicSubScheduler(parent NodeContext, parentPath string, emitUp func(*session.Event) error) *dynamicSubScheduler {
@@ -67,8 +78,23 @@ func (s *dynamicSubScheduler) runNode(child Node, input any, opts runNodeOptions
 	}
 	childPath := s.parentPath + "/" + name + "@" + runID
 
+	// Cache hit: skip child.Run; replay must re-honour delegation.
 	if cached, ok := s.lookupCachedOutput(childPath); ok {
+		if opts.useAsOutput {
+			if err := s.admitDelegation(childPath, name); err != nil {
+				return nil, err
+			}
+			s.commitDelegation(childPath, cached)
+		}
 		return cached, nil
+	}
+
+	// Reserve the delegation slot before child.Run so a later
+	// WithUseAsOutput for a different child fails fast.
+	if opts.useAsOutput {
+		if err := s.admitDelegation(childPath, name); err != nil {
+			return nil, err
+		}
 	}
 
 	childBranch := deriveChildBranch(s.parentCtx.Branch(), name, runID, opts.useSubBranch, opts.overrideBranch)
@@ -91,6 +117,9 @@ func (s *dynamicSubScheduler) runNode(child Node, input any, opts runNodeOptions
 	for ev, evErr := range child.Run(childCtx, input) {
 		if evErr != nil {
 			// Child error wins over any prior interrupt.
+			if opts.useAsOutput {
+				s.releaseDelegation(childPath)
+			}
 			return nil, &NodeRunError{
 				ChildName: name, ChildPath: childPath, RunID: runID,
 				Cause: fmt.Errorf("%w: %v", ErrNodeFailed, evErr),
@@ -113,8 +142,20 @@ func (s *dynamicSubScheduler) runNode(child Node, input any, opts runNodeOptions
 		}
 		if ev.Output != nil {
 			out = ev.Output
+			// Suppress output-bearing events from a delegated
+			// child so the parent's terminal event is the sole
+			// carrier of the value. Streaming/partial and
+			// state-only events (Output == nil) still propagate.
+			// Mirrors adk-python's _enqueue_event guard
+			// (workflow/_node_runner.py:312).
+			if opts.useAsOutput {
+				continue
+			}
 		}
 		if err := s.emitUp(ev); err != nil {
+			if opts.useAsOutput {
+				s.releaseDelegation(childPath)
+			}
 			return nil, &NodeRunError{
 				ChildName: name, ChildPath: childPath, RunID: runID,
 				Cause: fmt.Errorf("%w: emitUp: %v", ErrNodeFailed, err),
@@ -125,6 +166,9 @@ func (s *dynamicSubScheduler) runNode(child Node, input any, opts runNodeOptions
 	if interrupted {
 		// HITL is not terminal — parent re-runs on resume and is
 		// expected to re-invoke RunNode. Do not cache.
+		if opts.useAsOutput {
+			s.releaseDelegation(childPath)
+		}
 		return nil, &NodeRunError{
 			ChildName: name, ChildPath: childPath, RunID: runID,
 			Cause: ErrNodeInterrupted,
@@ -132,6 +176,9 @@ func (s *dynamicSubScheduler) runNode(child Node, input any, opts runNodeOptions
 	}
 
 	s.storeCachedOutput(childPath, out)
+	if opts.useAsOutput {
+		s.commitDelegation(childPath, out)
+	}
 	return out, nil
 }
 
@@ -146,6 +193,62 @@ func (s *dynamicSubScheduler) storeCachedOutput(childPath string, out any) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.resultByPath[childPath] = out
+}
+
+// admitDelegation reserves the use_as_output slot for childPath, or
+// returns ErrOutputAlreadyDelegated if a different child holds it.
+// Re-admitting the same childPath is a no-op (supports WithRunID
+// replay).
+func (s *dynamicSubScheduler) admitDelegation(childPath, childName string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.outputDelegated && s.delegatedChildPath != childPath {
+		return &NodeRunError{
+			ChildName: childName,
+			ChildPath: childPath,
+			Cause: fmt.Errorf("%w: %s already delegates to %s",
+				ErrOutputAlreadyDelegated, s.parentPath, s.delegatedChildName),
+		}
+	}
+	s.outputDelegated = true
+	s.delegatedChildPath = childPath
+	s.delegatedChildName = childName
+	return nil
+}
+
+// commitDelegation must follow a successful admitDelegation for the
+// same childPath; mismatches are silently dropped to avoid
+// clobbering another child's slot on a caller-side invariant break.
+func (s *dynamicSubScheduler) commitDelegation(childPath string, value any) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.outputDelegated || s.delegatedChildPath != childPath {
+		return
+	}
+	s.delegatedValue = value
+	s.delegatedCommitted = true
+}
+
+// releaseDelegation rolls back an uncommitted reservation when the
+// delegating child failed or was interrupted. No-op once committed.
+func (s *dynamicSubScheduler) releaseDelegation(childPath string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.delegatedCommitted || !s.outputDelegated || s.delegatedChildPath != childPath {
+		return
+	}
+	s.outputDelegated = false
+	s.delegatedChildPath = ""
+	s.delegatedChildName = ""
+}
+
+func (s *dynamicSubScheduler) delegatedOutput() (any, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.delegatedCommitted {
+		return nil, false
+	}
+	return s.delegatedValue, true
 }
 
 // resolveRunID validates a user-supplied id, or returns the next
